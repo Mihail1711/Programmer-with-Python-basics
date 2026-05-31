@@ -1,0 +1,163 @@
+import MetaTrader5 as mt5
+import pandas as pd
+import ta
+import time
+
+
+def get_filling_mode(symbol):
+    """ Намира автоматично поддържания начин на изпълнение от свойствата на символа """
+    info = mt5.symbol_info(symbol)
+    if info is None:
+        return mt5.ORDER_FILLING_IOC
+
+    filling_mode = info.filling_mode
+
+    # Сигурна числова проверка, работеща при всеки брокер
+    if filling_mode == 1:
+        return mt5.ORDER_FILLING_FOK
+    elif filling_mode == 2:
+        return mt5.ORDER_FILLING_IOC
+    else:
+        return mt5.ORDER_FILLING_RETURN
+
+
+if not mt5.initialize():
+    print("Connection to MT5 failed. Make sure the MetaTrader 5 application is open!")
+    mt5.shutdown()
+    quit()
+
+print("Successfully connected to MetaTrader 5!")
+
+# ВСИЧКИ ТВОИ АКТИВИ
+symbols_config = {
+    "XAUUSD": {"sl": 5.0, "tp": 10.0},  # Злато в Долари: SL $5, TP $10
+    "XAGUSD": {"sl": 0.30, "tp": 0.90},  # Сребро: SL 30 цента, TP 90 цента
+    "USTEC": {"sl": 30.0, "tp": 70.0},  # NASDAQ: SL 30 пункта, TP 70 пункта
+    "GBPUSD": {"sl": 0.0030, "tp": 0.0070},  # Паунд/Долар: SL 30 пипса, TP 70 пипса
+    "GBPJPY": {"sl": 0.30, "tp": 0.80},  # Паунд/Йена: SL 30 пипса, TP 80 пипса
+    "XAUEUR": {"sl": 5.0, "tp": 10.0}  # Злато в Евро: SL €5, TP €10
+}
+
+timeframe = mt5.TIMEFRAME_M15
+lot_size = 0.01
+
+
+def send_merket_order(sym, order_type, lot_size=0.01):
+    sym_info = mt5.symbol_info(sym)
+    if sym_info is None:
+        print(f"❌ [{sym}] Инструментът не съществува в платформата!")
+        return
+
+    if sym_info.trade_mode == mt5.SYMBOL_TRADE_MODE_DISABLED:
+        print(f"⚠️ [{sym}] Търговията е временно забранена от брокера! Пропускане...")
+        return
+
+    tick = mt5.symbol_info_tick(sym)
+    if tick is None:
+        print(f"[{sym}] Неуспешно взимане на текущ тик!")
+        return
+
+    price = tick.ask if order_type == mt5.ORDER_TYPE_BUY else tick.bid
+
+    sl_dist = symbols_config[sym]["sl"]
+    tp_dist = symbols_config[sym]["tp"]
+
+    if order_type == mt5.ORDER_TYPE_BUY:
+        sl_price = price - sl_dist
+        tp_price = price + tp_dist
+    else:
+        sl_price = price + sl_dist
+        tp_price = price - tp_dist
+
+    # Динамично закръгляне според актива
+    digits = 5 if "USD" in sym or "EUR" in sym and "XAU" not in sym else 2
+    if "JPY" in sym:
+        digits = 3
+    if "XAGUSD" in sym:
+        digits = 3
+
+    correct_filling = get_filling_mode(sym)
+
+    request = {
+        "sl": round(sl_price, digits),
+        "tp": round(tp_price, digits),
+        "action": mt5.TRADE_ACTION_DEAL,
+        "symbol": sym,
+        "volume": lot_size,
+        "type": order_type,
+        "price": price,
+        "deviation": 10,
+        "magic": 123456,
+        "comment": "Multi-Asset Bot",
+        "type_time": mt5.ORDER_TIME_GTC,
+        "type_filling": correct_filling,
+    }
+
+    print(
+        f"[{sym}] Изпращане на поръчка... Цена: {price} | SL: {round(sl_price, digits)} | TP: {round(tp_price, digits)}")
+    result = mt5.order_send(request)
+
+    if result.retcode != mt5.TRADE_RETCODE_DONE:
+        print(f"❌ [{sym}] Сделката беше отказана! Причина: {result.comment}")
+    else:
+        print(f"🚀 УСПЕХ! Сделката за {sym} е отворена в MetaTrader 5!")
+
+
+try:
+    while True:
+        for symbol in symbols_config.keys():
+
+            rates = mt5.copy_rates_from_pos(symbol, timeframe, 0, 100)
+
+            if rates is None or len(rates) == 0:
+                print(f"[{symbol}] Failed to get historical data. Skipping...")
+                continue
+
+            df = pd.DataFrame(rates)
+            df['time'] = pd.to_datetime(df['time'], unit='s')
+
+            df['SMA_20'] = ta.trend.sma_indicator(close=df['close'], window=20)
+            df['RSI_14'] = ta.momentum.rsi(close=df['close'], window=14)
+            df['MACD'] = ta.trend.macd(close=df['close'])
+            df['MACD_signal'] = ta.trend.macd_signal(close=df['close'])
+
+            # КРИТИЧНА ПРОМЯНА: Вземаме индекс -2 (последната НАПЪЛНО ЗАТВОРИЛА свещ)
+            closed_candle = df.iloc[-2]
+
+            current_price = closed_candle['close']
+            current_sma = closed_candle['SMA_20']
+            current_rsi = closed_candle['RSI_14']
+            current_macd = closed_candle['MACD']
+            current_macd_signal = closed_candle['MACD_signal']
+
+            if pd.isna(current_sma) or pd.isna(current_rsi) or pd.isna(current_macd):
+                continue
+
+            print(
+                f"[{symbol}] (Затворила свещ) Price: {current_price} | SMA_20: {current_sma:.2f} | RSI_14: {current_rsi:.2f} | MACD: {current_macd:.2f} | Signal: {current_macd_signal:.2f}")
+
+            open_positions = mt5.positions_get(symbol=symbol)
+
+            if open_positions is not None and len(open_positions) == 0:
+                # ЗАГАТНАТ BUY СИГНАЛ (RSI под 55 вместо 65)
+                if current_price > current_sma and current_rsi < 55 and current_macd > current_macd_signal:
+                    print(f"[{symbol}] Trend: BULLISH (Good for BUY) - Потвърдено на затворила свещ!")
+                    send_merket_order(symbol, mt5.ORDER_TYPE_BUY)
+
+                # ЗАГАТНАТ SELL СИГНАЛ (RSI над 45 вместо 35)
+                elif current_price < current_sma and current_rsi > 45 and current_macd < current_macd_signal:
+                    print(f"[{symbol}] Trend: BEARISH (Good for SELL) - Потвърдено на затворила свещ!")
+                    send_merket_order(symbol, mt5.ORDER_TYPE_SELL)
+
+                else:
+                    print(f"[{symbol}] Trend: NEUTRAL (Wait for better setup)")
+            else:
+                print(f"[{symbol}] Имаме активна сделка на пазара. Изчакване...")
+
+        print("=" * 50)
+        time.sleep(15)
+
+except KeyboardInterrupt:
+    print("\nBot stopped by user.")
+finally:
+    mt5.shutdown()
